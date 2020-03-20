@@ -535,7 +535,7 @@ sys.taskInit(function()
             local param = {product_name = _G.PROJECT, param_ver = dtu.param_ver, imei = misc.getImei()}
             code, head, body = httpv2.request("GET", dtu.host, 30000, param, nil, 1)
         else
-            url = "dtu.openluat.com/api/site/device/" .. misc.getImei() .. "/param?product_name=" .. _G.PROJECT .. "&param_ver=" .. dtu.param_ver
+            url = "site0.cn/api/dtu/device/" .. misc.getImei() .. "/param?product_name=" .. _G.PROJECT .. "&param_ver=" .. dtu.param_ver
             code, head, body = httpv2.request("GET", url, 30000, nil, nil, 1, misc.getImei() .. ":" .. misc.getMuid())
         end
         if tonumber(code) == 200 and body then
@@ -550,14 +550,14 @@ sys.taskInit(function()
         -- 检查是否有更新程序
         if tonumber(dtu.fota) == 1 then
             if is4gLod and rtos.fota_start() == 0 then
-                url = "iot.openluat.com/api/site/firmware_upgrade?project_key=" .. _G.PRODUCT_KEY
+                url = "iot.nutz.cn/api/site/firmware_upgrade?project_key=" .. _G.PRODUCT_KEY
                     .. "&imei=" .. misc.getImei() .. "&device_key=" .. misc.getSn()
                     .. "&firmware_name=" .. _G.PROJECT .. "_" .. rtos.get_version() .. "&version=" .. _G.VERSION
                 code, head, body = httpv2.request("GET", url, 30000, nil, nil, nil, nil, nil, nil, rtos.fota_process)
                 if tonumber(code) == 200 or tonumber(code) == 206 then rst = true end
                 rtos.fota_end()
             elseif not is4gLod then
-                url = "iot.openluat.com/api/site/firmware_upgrade?project_key=" .. _G.PRODUCT_KEY
+                url = "iot.nutz.cn/api/site/firmware_upgrade?project_key=" .. _G.PRODUCT_KEY
                     .. "&imei=" .. misc.getImei() .. "&device_key=" .. misc.getSn()
                     .. "&firmware_name=" .. _G.PROJECT .. "_" .. rtos.get_version() .. "&version=" .. _G.VERSION
                 code, head, body = httpv2.request("GET", url, 30000)
