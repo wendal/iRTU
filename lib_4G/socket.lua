@@ -14,7 +14,7 @@ local SENDSIZE = 11200
 -- 缓冲区最大下标
 local INDEX_MAX = 256
 -- 是否有socket正处在链接
-local socketsConnected = false
+local socketsConnected = 0
 --- SOCKET 是否有可用
 -- @return 可用true,不可用false
 socket.isReady = link.isReady
@@ -118,8 +118,9 @@ function mt:connect(address, port, timeout)
     
     self.address = address
     self.port = port
+    local socket_connect_fnc = (type(socketcore.sock_conn_ext)=="function") and socketcore.sock_conn_ext or socketcore.sock_conn
     if self.protocol == 'TCP' then
-        self.id = socketcore.sock_conn(0, address, port)
+        self.id = socket_connect_fnc(0, address, port)
     elseif self.protocol == 'TCPSSL' then
         local cert = {hostName = address}
         if self.cert then
@@ -136,9 +137,29 @@ function mt:connect(address, port, timeout)
                 cert.clientKey = io.readFile(self.cert.clientKey)
             end
         end
-        self.id = socketcore.sock_conn(2, address, port, cert)
+        self.id = socket_connect_fnc(2, address, port, cert)
     else
-        self.id = socketcore.sock_conn(1, address, port)
+        self.id = socket_connect_fnc(1, address, port)
+    end
+    if type(socketcore.sock_conn_ext)=="function" then
+        if not self.id or self.id<0 then
+            if self.id==-2 then
+                require "http"
+                --请求腾讯云免费HttpDns解析
+                http.request("GET", "119.29.29.29/d?dn=" .. address, nil, nil, nil, 40000,
+                    function(result, statusCode, head, body)
+                        log.info("socket.httpDnsCb", result, statusCode, head, body)
+                        sys.publish("SOCKET_HTTPDNS_RESULT_"..address.."_"..port, result, statusCode, head, body)
+                    end)
+                local _, result, statusCode, head, body = sys.waitUntil("SOCKET_HTTPDNS_RESULT_"..address.."_"..port)
+                
+                --DNS解析成功
+                if result and statusCode == "200" and body and body:match("^[%d%.]+") then
+                    return self:connect(body:match("^([%d%.]+)"),port,timeout)                
+                end
+            end
+            self.id = nil
+        end
     end
     if not self.id then
         log.info("socket:connect: core sock conn error", self.protocol, address, port, self.cert)
@@ -156,9 +177,13 @@ function mt:connect(address, port, timeout)
         return false
     end
     log.info("socket:connect: connect ok")
-    self.connected = true
-    socketsConnected = self.connected or socketsConnected
-    sys.publish("SOCKET_ACTIVE", socketsConnected)
+    
+    if not self.connected then
+        self.connected = true
+        socketsConnected = socketsConnected+1
+        sys.publish("SOCKET_ACTIVE", socketsConnected>0)
+    end
+    
     return true, self.id
 end
 
@@ -174,6 +199,7 @@ function mt:asyncSelect(keepAlive, pingreq)
     end
     
     self.wait = "SOCKET_SEND"
+    --log.info("socket.asyncSelect #self.output",#self.output)
     while #self.output ~= 0 do
         local data = table.concat(self.output)
         self.output = {}
@@ -183,11 +209,13 @@ function mt:asyncSelect(keepAlive, pingreq)
             if self.timeout then
                 self.timerId = sys.timerStart(coroutine.resume, self.timeout * 1000, self.co, false, "TIMEOUT")
             end
+            --log.info("socket.asyncSelect self.timeout",self.timeout)
             local result, reason = coroutine.yield()
             if self.timerId and reason ~= "TIMEOUT" then sys.timerStop(self.timerId) end
             sys.publish("SOCKET_ASYNC_SEND", result)
             if not result then
                 sys.publish("LIB_SOCKET_SEND_FAIL_IND", self.ssl, self.protocol, self.address, self.port)
+                --log.warn('socket.asyncSelect', 'send error')
                 return false
             end
         end
@@ -203,6 +231,11 @@ function mt:asyncSelect(keepAlive, pingreq)
     end
     return coroutine.yield()
 end
+
+function mt:getAsyncSend()
+    if self.error then return 0 end
+    return #(self.output)
+end
 --- 异步发送数据
 -- @string data 数据
 -- @number[opt=nil] timeout 可选参数，发送超时时间，单位秒；为nil时表示不支持timeout
@@ -215,6 +248,7 @@ function mt:asyncSend(data, timeout)
     end
     self.timeout = timeout
     table.insert(self.output, data or "")
+    --log.info("socket.asyncSend",self.wait)
     if self.wait == "SOCKET_WAIT" then coroutine.resume(self.co, true) end
     return true
 end
@@ -265,22 +299,25 @@ end
 --- 接收数据
 -- @number[opt=0] timeout 可选参数，接收超时时间，单位毫秒
 -- @string[opt=nil] msg 可选参数，控制socket所在的线程退出recv阻塞状态
+-- @bool[opt=nil] msgNoResume 可选参数，控制socket所在的线程退出recv阻塞状态，false或者nil表示“在recv阻塞状态，收到msg消息，可以退出阻塞状态”，true表示不退出
 -- @return result 数据接收结果，true表示成功，false表示失败
--- @return data 如果成功的话，返回接收到的数据；超时时返回错误为"timeout"；msg控制退出时返回msg
+-- @return data 如果成功的话，返回接收到的数据；超时时返回错误为"timeout"；msg控制退出时返回msg的字符串
+-- @return param 如果是msg返回的false，则data的值是msg，param的值是msg的参数
 -- @usage c = socket.tcp(); c:connect()
 -- @usage result, data = c:recv()
 -- @usage false,msg,param = c:recv(60000,"publish_msg")
-function mt:recv(timeout, msg)
+function mt:recv(timeout, msg, msgNoResume)
     assert(self.co == coroutine.running(), "socket:recv: coroutine mismatch")
     if self.error then
         log.warn('socket.client:recv', 'error', self.error)
         return false
     end
+    self.msgNoResume = msgNoResume
     if msg and not self.iSubscribe then
         self.iSubscribe = msg
         self.subMessage = function(data)
             if data then table.insert(self.output, data) end
-            if self.wait == "+RECEIVE" then coroutine.resume(self.co, 0xAA) end
+            if self.wait == "+RECEIVE" and not self.msgNoResume then coroutine.resume(self.co, 0xAA) end
         end
         sys.subscribe(msg, self.subMessage)
     end
@@ -334,7 +371,7 @@ function mt:close()
     --if self.connected then
     log.info("socket:sock_close", self.id)
     local result, reason
-    self.connected = false
+    
     if self.id then
         socketcore.sock_close(self.id)
         self.wait = "SOCKET_CLOSE"
@@ -343,8 +380,13 @@ function mt:close()
             if reason == "RESPONSE" then break end
         end
     end
-    socketsConnected = self.connected or socketsConnected
-    sys.publish("SOCKET_ACTIVE", socketsConnected)
+    if self.connected then
+        self.connected = false
+        if socketsConnected>0 then
+            socketsConnected = socketsConnected-1
+        end
+        sys.publish("SOCKET_ACTIVE", socketsConnected>0)
+    end
     --end
     if self.id ~= nil then
         sockets[self.id] = nil
@@ -383,13 +425,20 @@ rtos.on(rtos.MSG_SOCK_CLOSE_IND, function(msg)
         log.warn('close ind on nil socket', msg.socket_index, msg.id)
         return
     end
-    sockets[msg.socket_index].connected = false
+    if sockets[msg.socket_index].connected then
+        sockets[msg.socket_index].connected = false
+        if socketsConnected>0 then
+            socketsConnected = socketsConnected-1
+        end
+        sys.publish("SOCKET_ACTIVE", socketsConnected>0)
+    end
     sockets[msg.socket_index].error = 'CLOSED'
-    socketsConnected = sockets[msg.socket_index].connected or socketsConnected
-    sys.publish("SOCKET_ACTIVE", socketsConnected)
+    
+    --[[
     if type(socketcore.sock_destroy) == "function" then
         socketcore.sock_destroy(msg.socket_index)
-    end
+    end]]
+    sys.publish("LIB_SOCKET_CLOSE_IND", sockets[msg.socket_index].ssl, sockets[msg.socket_index].protocol, sockets[msg.socket_index].address, sockets[msg.socket_index].port)
     coroutine.resume(sockets[msg.socket_index].co, false, "CLOSED")
 end)
 rtos.on(rtos.MSG_SOCK_RECV_IND, function(msg)
@@ -427,7 +476,24 @@ function setTcpResendPara(retryCnt, retryMaxTimeout)
     ril.request("AT+TCPUSERPARAM=6," .. (retryCnt or 4) .. ",7200," .. (retryMaxTimeout or 16))
 end
 
--- setTcpResendPara(1, 16)
+--- 设置域名解析参数
+-- 注意：0027以及之后的core版本才支持此功能
+-- @number[opt=4] retryCnt，重传次数；取值范围1到8
+-- @number[opt=4] retryTimeoutMulti，重传超时时间倍数，取值范围1到5
+--                第n次重传超时时间的计算方式为：第n次的重传超时基数*retryTimeoutMulti，单位为秒
+--                重传超时基数表为{1, 1, 2, 4, 4, 4, 4, 4}
+--                第1次重传超时时间为：1*retryTimeoutMulti 秒
+--                第2次重传超时时间为：1*retryTimeoutMulti 秒
+--                第3次重传超时时间为：2*retryTimeoutMulti 秒
+--                ...........................................
+--                第8次重传超时时间为：8*retryTimeoutMulti 秒
+-- @return nil
+-- @usage
+-- socket.setDnsParsePara(8,5)
+function setDnsParsePara(retryCnt, retryTimeoutMulti)
+    ril.request("AT*DNSTMOUT="..(retryCnt or 4)..","..(retryTimeoutMulti or 4))
+end
+
 --- 打印所有socket的状态
 -- @return 无
 -- @usage socket.printStatus()
@@ -438,3 +504,6 @@ function printStatus()
         end
     end
 end
+
+--setDnsParsePara(4,4)
+--setTcpResendPara(1,16)

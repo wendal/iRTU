@@ -20,12 +20,15 @@ require "common"
 require "tracker"
 module(..., package.seeall)
 ---------------------------------------------------------- 这个模块为2G和4G通用部分 ----------------------------------------------------------
-local softDog, datalink = 0, false
+local datalink = false
 -- 定时采集任务的参数
 local interval, samptime = {0, 0}, {0, 0}
 -- 获取经纬度
 local lat, lng = 0, 0
+-- 无网络重启时间，飞行模式启动时间
+local rstTim, flyTim = 600000, 300000
 
+-- 保存获取的基站坐标
 function setLocation(la, ln)
     lat, lng = la, ln
     log.info("基站定位请求的结果:", lat, lng)
@@ -97,6 +100,7 @@ local function userapi(str, pios)
     local t = str:match("(.-)\r?\n") and str:match("(.-)\r?\n"):split(',') or str:split(',')
     local rrpc = table.remove(t, 1)
     local reqcmd = table.remove(t, 1)
+    log.warn("user api:", rrpc, reqcmd)
     if default.cmd[rrpc] and default.cmd[rrpc][reqcmd] then
         return default.cmd[rrpc][reqcmd](t)
     else
@@ -112,50 +116,55 @@ local function tcpTask(cid, pios, reg, convert, passon, upprot, dwprot, prot, pi
     local upprotFnc = upprot and upprot[cid] and upprot[cid] ~= "" and loadstring(upprot[cid]:match("function(.+)end"))
     while true do
         local idx = 0
-        if not socket.isReady() and not sys.waitUntil("IP_READY_IND", 300000) then sys.restart("网络初始化失败!") end
+        if not socket.isReady() and not sys.waitUntil("IP_READY_IND", rstTim) then sys.restart("网络初始化失败!") end
         local c = prot == "TCP" and socket.tcp(ssl and ssl:lower() == "ssl") or socket.udp()
-        while not c:connect(addr, port) do sys.wait((2 ^ idx) * 1000)idx = 2 ^ idx > 126320 and 0 or idx + 1 end
+        while not c:connect(addr, port) do sys.wait((2 ^ idx) * 1000)idx = idx > 9 and 0 or idx + 1 end
         -- 登陆报文
-        if c:send(login or loginMsg(reg)) then
-            interval[uid], samptime[uid] = tonumber(gap) or 0, tonumber(report) or 0
-            while true do
-                datalink = true
-                local result, data, param = c:recv(timeout * 1000, "NET_SENT_RDY_" .. (passon and cid or uid))
-                if result then
-                    -- 这里执行用户自定义的指令
-                    if data:sub(1, 5) == "rrpc," then
-                        local res, msg = pcall(userapi, data, pios)
-                        if not res then log.error("远程查询的API错误:", msg) end
-                        if convert == 0 and upprotFnc then -- 转换为用户自定义报文
-                            res, msg = pcall(upprotFnc, msg)
-                            if not res then log.error("数据流模版错误:", msg) end
-                        end
-                        if not c:send(msg) then break end
-                    elseif convert == 1 then -- 转换HEX String
-                        sys.publish("NET_RECV_WAIT_" .. uid, uid, (data:fromHex()))
-                    elseif convert == 0 and dwprotFnc then -- 转换用户自定义报文
-                        local res, msg = pcall(dwprotFnc, data)
+        if login or loginMsg(reg) then c:send(login or loginMsg(reg)) end
+        interval[uid], samptime[uid] = tonumber(gap) or 0, tonumber(report) or 0
+        while true do
+            datalink = true
+            local result, data, param = c:recv(timeout * 1000, "NET_SENT_RDY_" .. (passon and cid or uid))
+            if result then
+                -- 这里执行用户自定义的指令
+                if data:sub(1, 5) == "rrpc," or data:sub(1, 7) == "config," then
+                    local res, msg = pcall(userapi, data, pios)
+                    if not res then log.error("远程查询的API错误:", msg) end
+                    if convert == 0 and upprotFnc then -- 转换为用户自定义报文
+                        res, msg = pcall(upprotFnc, msg)
                         if not res then log.error("数据流模版错误:", msg) end
+                    end
+                    if not c:send(msg) then break end
+                elseif convert == 1 then -- 转换HEX String
+                    sys.publish("NET_RECV_WAIT_" .. uid, uid, (data:fromHex()))
+                elseif convert == 0 and dwprotFnc then -- 转换用户自定义报文
+                    local res, msg = pcall(dwprotFnc, data)
+                    if not res or not msg then
+                        log.error("数据流模版错误:", msg)
+                    else
                         sys.publish("NET_RECV_WAIT_" .. uid, uid, res and msg or data)
-                    else -- 默认不转换
-                        sys.publish("NET_RECV_WAIT_" .. uid, uid, data)
                     end
-                elseif data == ("NET_SENT_RDY_" .. (passon and cid or uid)) then
-                    if convert == 1 then -- 转换为Hex String 报文
-                        if not c:send((param:toHex())) then if passon then sys.publish("UART_SENT_RDY_" .. uid, uid, "SEND_ERROR\r\n") end break end
-                    elseif convert == 0 and upprotFnc then -- 转换为用户自定义报文
-                        local res, msg = pcall(upprotFnc, param)
-                        if not res then log.error("数据流模版错误:", msg) end
-                        if not c:send(res and msg or param) then if passon then sys.publish("UART_SENT_RDY_" .. uid, uid, "SEND_ERROR\r\n") end break end
-                    else -- 默认不转换
-                        if not c:send(param) then if passon then sys.publish("UART_SENT_RDY_" .. uid, uid, "SEND_ERROR\r\n") end break end
-                    end
-                    if passon then sys.publish("UART_SENT_RDY_" .. uid, uid, "SEND_OK\r\n") end
-                elseif data == "timeout" then
-                    if not c:send(conver(ping)) then break end
-                else
-                    break
+                else -- 默认不转换
+                    sys.publish("NET_RECV_WAIT_" .. uid, uid, data)
                 end
+            elseif data == ("NET_SENT_RDY_" .. (passon and cid or uid)) then
+                if convert == 1 then -- 转换为Hex String 报文
+                    if not c:send((param:toHex())) then if passon then sys.publish("UART_SENT_RDY_" .. uid, uid, "SEND_ERROR\r\n") end break end
+                elseif convert == 0 and upprotFnc then -- 转换为用户自定义报文
+                    local res, msg = pcall(upprotFnc, param)
+                    if not res or not msg then
+                        log.error("数据流模版错误:", msg)
+                    else
+                        if not c:send(res and msg or param) then if passon then sys.publish("UART_SENT_RDY_" .. uid, uid, "SEND_ERROR\r\n") end break end
+                    end
+                else -- 默认不转换
+                    if not c:send(param) then if passon then sys.publish("UART_SENT_RDY_" .. uid, uid, "SEND_ERROR\r\n") end break end
+                end
+                if passon then sys.publish("UART_SENT_RDY_" .. uid, uid, "SEND_OK\r\n") end
+            elseif data == "timeout" then
+                if not c:send(conver(ping)) then break end
+            else
+                break
             end
         end
         c:close()
@@ -208,9 +217,9 @@ local function mqttTask(cid, pios, reg, convert, passon, upprot, dwprot, keepAli
     if not will or will == "" then will = nil else will = {qos = 1, retain = 0, topic = will, payload = misc.getImei()} end
     while true do
         local messageId, idx = false, 0
-        if not socket.isReady() and not sys.waitUntil("IP_READY_IND", 300000) then sys.restart("网络初始化失败!") end
+        if not socket.isReady() and not sys.waitUntil("IP_READY_IND", rstTim) then sys.restart("网络初始化失败!") end
         local mqttc = mqtt.client(clientID, keepAlive, conver(usr), conver(pwd), cleansession, will, "3.1.1")
-        while not mqttc:connect(addr, port, ssl == "tcp_ssl" and ssl or nil, cert) do sys.wait((2 ^ idx) * 1000)idx = 2 ^ idx > 126320 and 0 or idx + 1 end
+        while not mqttc:connect(addr, port, ssl == "tcp_ssl" and ssl or nil, cert) do sys.wait((2 ^ idx) * 1000)idx = idx > 9 and 0 or idx + 1 end
         -- 初始化订阅主题
         if mqttc:subscribe(sub, qos) then
             if loginMsg(reg) then mqttc:publish(pub[1], loginMsg(reg), tonumber(pub[2]) or qos, retain) end
@@ -221,7 +230,7 @@ local function mqttTask(cid, pios, reg, convert, passon, upprot, dwprot, keepAli
                     log.info("订阅的消息:", packet and packet.topic)
                     messageId = packet.topic:match(".+/rrpc/request/(%d+)")
                     -- 这里执行用户自定义的指令
-                    if packet.payload:sub(1, 5) == "rrpc," then
+                    if packet.payload:sub(1, 5) == "rrpc," or packet.payload:sub(1, 7) == "config," then
                         local res, msg = pcall(userapi, packet.payload, pios)
                         if not res then log.error("远程查询的API错误:", msg) end
                         if convert == 0 and upprotFnc then -- 转换为用户自定义报文
@@ -233,8 +242,11 @@ local function mqttTask(cid, pios, reg, convert, passon, upprot, dwprot, keepAli
                         sys.publish("UART_SENT_RDY_" .. uid, uid, (packet.payload:fromHex()))
                     elseif convert == 0 and dwprotFnc then -- 转换用户自定义报文
                         local res, msg = pcall(dwprotFnc, packet.payload)
-                        if not res then log.error("数据流模版错误:", msg) end
-                        sys.publish("UART_SENT_RDY_" .. uid, uid, res and msg or packet.payload)
+                        if not res or not msg then
+                            log.error("数据流模版错误:", msg)
+                        else
+                            sys.publish("UART_SENT_RDY_" .. uid, uid, res and msg or packet.payload)
+                        end
                     else -- 默认不转换
                         sys.publish("UART_SENT_RDY_" .. uid, uid, packet.payload)
                     end
@@ -246,11 +258,14 @@ local function mqttTask(cid, pios, reg, convert, passon, upprot, dwprot, keepAli
                         if not mqttc:publish(pub[1], (param:toHex()), tonumber(pub[2]) or qos, retain) then if passon then sys.publish("UART_SENT_RDY_" .. uid, uid, "SEND_ERROR\r\n") end break end
                     elseif convert == 0 and upprotFnc then -- 转换为用户自定义报文
                         local res, msg, index = pcall(upprotFnc, param)
-                        if not res then log.error("数据流模版错误:", msg) end
-                        index = tonumber(index) or 1
-                        local pub_topic = (pub[index]:sub(-1, -1) == "+" and messageId) and pub[index]:sub(1, -2) .. messageId or pub[index]
-                        log.info("-----发布的主题:", pub_topic)
-                        if not mqttc:publish(pub_topic, res and msg or param, tonumber(pub[index + 1]) or qos, retain) then if passon then sys.publish("UART_SENT_RDY_" .. uid, uid, "SEND_ERROR\r\n") end break end
+                        if not res or not msg then
+                            log.error("数据流模版错误:", msg)
+                        else
+                            index = tonumber(index) or 1
+                            local pub_topic = (pub[index]:sub(-1, -1) == "+" and messageId) and pub[index]:sub(1, -2) .. messageId or pub[index]
+                            log.info("-----发布的主题:", pub_topic)
+                            if not mqttc:publish(pub_topic, res and msg or param, tonumber(pub[index + 1]) or qos, retain) then if passon then sys.publish("UART_SENT_RDY_" .. uid, uid, "SEND_ERROR\r\n") end break end
+                        end
                     else
                         local pub_topic = (pub[1]:sub(-1, -1) == "+" and messageId) and pub[1]:sub(1, -2) .. messageId or pub[1]
                         log.info("-----发布的主题:", pub_topic)
@@ -347,9 +362,9 @@ local function oneNet_mqtt(cid, pios, reg, convert, passon, upprot, dwprot, keep
     local upprotFnc = upprot and upprot[cid] and upprot[cid] ~= "" and loadstring(upprot[cid]:match("function(.+)end"))
     while true do
         local idx, rsp = 0, false
-        if not socket.isReady() and not sys.waitUntil("IP_READY_IND", 300000) then sys.restart("网络初始化失败!") end
+        if not socket.isReady() and not sys.waitUntil("IP_READY_IND", rstTim) then sys.restart("网络初始化失败!") end
         local mqttc = mqtt.client(dat.data.device_id, keepAlive, pid, dat.data.key, cleanSession)
-        while not mqttc:connect(addr, port) do sys.wait((2 ^ idx) * 1000)idx = 2 ^ idx > 126320 and 0 or idx + 1 end
+        while not mqttc:connect(addr, port) do sys.wait((2 ^ idx) * 1000)idx = idx > 9 and 0 or idx + 1 end
         if mqttc:subscribe("$creq/#", qos) then
             while true do
                 datalink = true
@@ -358,7 +373,7 @@ local function oneNet_mqtt(cid, pios, reg, convert, passon, upprot, dwprot, keep
                 if r then
                     rsp = packet.topic:match("$creq/(%g+)")
                     -- 主题类型-rrpc请求
-                    if packet.payload:sub(1, 5) == "rrpc," then
+                    if packet.payload:sub(1, 5) == "rrpc," or packet.payload:sub(1, 7) == "config," then
                         local res, msg = pcall(userapi, packet.payload, pios)
                         if not res then log.error("远程查询的API错误:", msg) end
                         if convert == 0 and upprotFnc then -- 转换为用户自定义报文
@@ -373,8 +388,11 @@ local function oneNet_mqtt(cid, pios, reg, convert, passon, upprot, dwprot, keep
                             sys.publish("UART_SENT_RDY_" .. uid, uid, (packet.payload:fromHex()))
                         elseif convert == 0 and dwprotFnc then -- 转换用户自定义报文
                             local res, msg = pcall(dwprotFnc, packet.payload)
-                            if not res then log.error("数据流模版错误:", msg) end
-                            sys.publish("UART_SENT_RDY_" .. uid, uid, res and msg or packet.payload)
+                            if not res or not msg then
+                                log.error("数据流模版错误:", msg)
+                            else
+                                sys.publish("UART_SENT_RDY_" .. uid, uid, res and msg or packet.payload)
+                            end
                         else
                             sys.publish("UART_SENT_RDY_" .. uid, uid, packet.payload)
                         end
@@ -388,9 +406,12 @@ local function oneNet_mqtt(cid, pios, reg, convert, passon, upprot, dwprot, keep
                         if not mqttc:publish(rsp and "$crsp/" .. rsp or "$dp", (param:toHex()), qos, retain) then if passon then sys.publish("UART_SENT_RDY_" .. uid, uid, "SEND_ERROR\r\n") end break end
                     elseif convert == 0 and upprotFnc then -- 转换为用户自定义报文
                         local res, msg = pcall(upprotFnc, param)
-                        if not res then log.error("数据流模版错误:", msg) end
-                        if msg then msg = pack.pack("b>HA", ptype, #msg, msg) end
-                        if not mqttc:publish(rsp and "$crsp/" .. rsp or "$dp", msg, qos, retain) then if passon then sys.publish("UART_SENT_RDY_" .. uid, uid, "SEND_ERROR\r\n") end break end
+                        if not res or not msg then
+                            log.error("数据流模版错误:", msg)
+                        else
+                            if msg then msg = pack.pack("b>HA", ptype, #msg, msg) end
+                            if not mqttc:publish(rsp and "$crsp/" .. rsp or "$dp", msg, qos, retain) then if passon then sys.publish("UART_SENT_RDY_" .. uid, uid, "SEND_ERROR\r\n") end break end
+                        end
                     else -- 不转换报文
                         if param then param = pack.pack("b>HA", ptype, #param, param) end
                         if not mqttc:publish(rsp and "$crsp/" .. rsp or "$dp", param, qos, retain) then if passon then sys.publish("UART_SENT_RDY_" .. uid, uid, "SEND_ERROR\r\n") end break end
@@ -558,7 +579,7 @@ end
 -- 设备型注册
 local function bdiotDeviceReg(regio, schemaId, ak, sk)
     local host = "iotdm." .. regio .. ".baidubce.com"
-    if not socket.isReady() and not sys.waitUntil("IP_READY_IND", 120000) then sys.restart("网络初始化失败!") end
+    if not socket.isReady() and not sys.waitUntil("IP_READY_IND", rstTim) then sys.restart("网络初始化失败!") end
     local data = {
         deviceName = misc.getImei(),
         description = sim.getIccid(),
@@ -613,7 +634,7 @@ local function bdiotDataReg(regio, endpoint, ak, sk, principal, pk)
     local login = {}
     login.tcpEndpoint = "tcp://" .. endpoint .. ".mqtt.iot." .. regio .. ".baidubce.com:1883"
     login.sslEndpoint = "ssl://" .. endpoint .. ".mqtt.iot." .. regio .. ".baidubce.com:1884"
-    if not socket.isReady() and not sys.waitUntil("IP_READY_IND", 120000) then sys.restart("网络初始化失败!") end
+    if not socket.isReady() and not sys.waitUntil("IP_READY_IND", rstTim) then sys.restart("网络初始化失败!") end
     local data = {
         thingName = misc.getImei(),
         endpointName = endpoint,
@@ -666,7 +687,10 @@ end
 -- sys.taskInit(bdiotDataReg, "gz", "91k8gp4", "d046057ca2664ef6a0b785407a94e6ff", "03a1f3358a7c457a92040d3cd79526ea", "device", "l5t4chXaoFclITJQ")
 local function bdiotDevice(cid, pios, reg, convert, passon, upprot, dwprot, keepAlive, timeout, regio, schemaId, ak, sk, cleansession, qos, uid, ssl)
     local msg = bdiotDeviceReg(regio, schemaId, ak, sk)
-    if not msg then log.warn("-------------------百度天工物接入失败-----------------------", "fail") end
+    if not msg then
+        log.warn("-------------------百度天工物接入失败-----------------------", "fail")
+        return
+    end
     ssl = ssl:lower()
     local host = ssl == "tcp_ssl" and msg.sslEndpoint or msg.tcpEndpoint
     local addr, port = host:match("//(.+):(%d+)")
@@ -676,7 +700,10 @@ local function bdiotDevice(cid, pios, reg, convert, passon, upprot, dwprot, keep
 end
 local function bdiotData(cid, pios, reg, convert, passon, upprot, dwprot, keepAlive, timeout, regio, endpoint, ak, sk, principal, pk, sub, pub, cleansession, qos, uid, ssl, will)
     local msg = bdiotDataReg(regio, endpoint, ak, sk, principal, pk)
-    if not msg then log.warn("-------------------百度天工物接入失败-----------------------", "fail") end
+    if not msg then
+        log.warn("-------------------百度天工物接入失败-----------------------", "fail")
+        return
+    end
     ssl = ssl:lower()
     local host = ssl == "tcp_ssl" and msg.sslEndpoint or msg.tcpEndpoint
     local addr, port = host:match("//(.+):(%d+)")
@@ -756,7 +783,7 @@ end
 ---------------------------------------------------------- 参数配置,任务转发，线程守护主进程----------------------------------------------------------
 function connect(pios, conf, reg, convert, passon, upprot, dwprot)
     local flyTag = false
-    if not socket.isReady() and not sys.waitUntil("IP_READY_IND", 120000) then sys.restart("网络初始化失败!") end
+    if not socket.isReady() and not sys.waitUntil("IP_READY_IND", rstTim) then sys.restart("网络初始化失败!") end
     sys.waitUntil("DTU_PARAM_READY", 120000)
     -- 自动创建透传任务并填入参数
     for k, v in pairs(conf or {}) do
@@ -782,11 +809,11 @@ function connect(pios, conf, reg, convert, passon, upprot, dwprot)
                             msg = msg:toHex()
                         elseif convert == 0 and upprotFnc then -- 转换为用户自定义报文
                             local res, dat = pcall(upprotFnc, msg)
-                            if not res then log.error("数据流模版错误:", msg) end
+                            if not res or not msg then log.error("数据流模版错误:", msg) end
                             msg = res and dat or msg
                         end
                         if passon then sys.publish("UART_SENT_RDY_" .. uid, uid, "SEND_OK\r\n") end
-                        local code, head, body = httpv2.request(method:upper(), url, timeout * 1000, way == 0 and msg or nil, way == 1 and msg or nil, dtpye, basic, headers)
+                        local code, head, body = httpv2.request(method:upper(), url, timeout * 1000, way == 0 and msg or nil, way == 1 and msg or nil, dtype, basic, headers)
                         local headstr = ""
                         if type(head) == "table" then
                             for k, v in pairs(head) do headstr = headstr .. k .. ": " .. v .. "\r\n" end
@@ -798,9 +825,12 @@ function connect(pios, conf, reg, convert, passon, upprot, dwprot)
                             sys.publish("NET_RECV_WAIT_" .. uid, uid, str)
                         elseif convert == 0 and dwprotFnc then -- 转换用户自定义报文
                             local res, code, head, body = pcall(dwprotFnc, code, head, body)
-                            if not res then log.error("数据流模版错误:", msg) end
-                            local str = (tonumber(iscode) ~= 1 and code .. "\r\n" or "") .. (tonumber(ishead) ~= 1 and headstr or "") ~= 1 .. (tonumber(isbody) ~= 1 and body or "")
-                            sys.publish("NET_RECV_WAIT_" .. uid, uid, res and str or code)
+                            if not res or not msg then
+                                log.error("数据流模版错误:", msg)
+                            else
+                                local str = (tonumber(iscode) ~= 1 and code .. "\r\n" or "") .. (tonumber(ishead) ~= 1 and headstr or "") ~= 1 .. (tonumber(isbody) ~= 1 and body or "")
+                                sys.publish("NET_RECV_WAIT_" .. uid, uid, res and str or code)
+                            end
                         else -- 默认不转换
                             sys.publish("NET_RECV_WAIT_" .. uid, uid, (tonumber(iscode) ~= 1 and code .. "\r\n" or "") .. (tonumber(ishead) ~= 1 and headstr or "") .. (tonumber(isbody) ~= 1 and body or ""))
                         end
@@ -848,22 +878,17 @@ function connect(pios, conf, reg, convert, passon, upprot, dwprot)
     -- 守护进程
     while true do
         -- 这里是网络正常,但是链接服务器失败重启
-        if datalink then sys.timerStart(sys.restart, 1800000, "Server connection failed") end
-        if not datalink then softDog = softDog + 1 else softDog = 0 end
-        if softDog > 120 and not flyTag then
-            net.switchFly(true)
-            sys.wait(5000)
-            net.switchFly(false)
-            flyTag = true
-            softDog = 0
-        end
+        if datalink then sys.timerStart(sys.restart, rstTim, "Server connection failed") end
         sys.wait(1000)
     end
 end
 net.switchFly(false)
 -- NTP同步失败强制重启
-local tid = sys.timerStart(sys.restart, 180000, "同步时间失败,可能是GSM无法附着!")
-sys.subscribe("NTP_SUCCEED", function()
-    log.info("---------------------- 网络注册已成功 ----------------------")
+local tid = sys.timerStart(function()
+    net.switchFly(true)
+    sys.timerStart(net.switchFly, 5000, false)
+end, flyTim)
+sys.subscribe("IP_READY_IND", function()
     sys.timerStop(tid)
+    log.info("---------------------- 网络注册已成功 ----------------------")
 end)

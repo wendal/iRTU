@@ -17,7 +17,6 @@ require "lbsLoc"
 require "socket"
 require "audio"
 require "httpv2"
-require "gpsv2"
 require "common"
 require "create"
 require "tracker"
@@ -25,6 +24,7 @@ module(..., package.seeall)
 
 -- 判断模块类型
 local is4gLod = rtos.get_version():upper():find("ASR1802")
+local is1802S = rtos.get_version():upper():find("ASR1802S")
 local isTTS = rtos.get_version():upper():find("TTS") or rtos.get_version():upper():find("8955F")
 -- 用户的配置参数
 local CONFIG = "/CONFIG.cnf"
@@ -118,7 +118,43 @@ if io.exists(CONFIG) then
 end
 ---------------------------------------------------------- 用户控制 GPIO 配置 ----------------------------------------------------------
 -- 用户可用IO列表
-pios = is4gLod and {
+pios = is1802S and {
+    pio10 = pins.setup(10, nil, pio.PULLDOWN),
+    pio11 = pins.setup(11, nil, pio.PULLDOWN),
+    pio17 = pins.setup(17, nil, pio.PULLDOWN),
+    pio18 = pins.setup(18, nil, pio.PULLDOWN),
+    pio20 = pins.setup(20, nil, pio.PULLDOWN),
+    pio23 = pins.setup(23, nil, pio.PULLDOWN),
+    pio24 = pins.setup(24, nil, pio.PULLDOWN),
+    pio25 = pins.setup(25, nil, pio.PULLDOWN),
+    pio26 = pins.setup(26, nil, pio.PULLDOWN),
+    pio27 = pins.setup(27, nil, pio.PULLDOWN),
+    pio28 = pins.setup(28, nil, pio.PULLDOWN),
+    pio29 = pins.setup(29, nil, pio.PULLDOWN),
+    pio30 = pins.setup(30, nil, pio.PULLDOWN),
+    pio31 = pins.setup(31, nil, pio.PULLDOWN),
+    pio32 = pins.setup(32, 0, pio.PULLUP), -- UART2 485 默认方向脚
+    pio33 = pins.setup(33, nil, pio.PULLDOWN),
+    pio34 = pins.setup(34, nil, pio.PULLDOWN),
+    pio35 = pins.setup(35, nil, pio.PULLDOWN),
+    pio36 = pins.setup(36, nil, pio.PULLDOWN),
+    pio37 = pins.setup(37, nil, pio.PULLDOWN),
+    pio38 = pins.setup(38, nil, pio.PULLDOWN),
+    pio39 = pins.setup(39, nil, pio.PULLDOWN),
+    pio40 = pins.setup(40, nil, pio.PULLDOWN),
+    pio41 = pins.setup(41, nil, pio.PULLDOWN),
+    pio42 = pins.setup(42, nil, pio.PULLDOWN),
+    pio49 = pins.setup(49, nil, pio.PULLDOWN),
+    pio50 = pins.setup(50, nil, pio.PULLDOWN),
+    -- pio51 = pins.setup(51, nil, pio.PULLDOWN), -- UART1 rxd
+    -- pio52 = pins.setup(52, nil, pio.PULLDOWN), -- uart 1 txd
+    pio61 = pins.setup(61, 0, pio.PULLUP), -- UART1 485 默认方向脚
+    pio62 = pins.setup(62, nil, pio.PULLDOWN),
+    pio63 = pins.setup(63, nil, pio.PULLDOWN),
+    pio64 = pins.setup(64, 0, pio.PULLUP), -- NETLED
+    pio65 = pins.setup(65, nil, pio.PULLDOWN),
+-- pio66 = pins.setup(66, nil, pio.PULLDOWN),
+} or (is4gLod and {
     pio23 = pins.setup(23, 0, pio.PULLUP), -- 默认UART1的485方向控制脚
     pio26 = pins.setup(26, nil, pio.PULLDOWN),
     pio27 = pins.setup(27, nil, pio.PULLDOWN),
@@ -127,8 +163,6 @@ pios = is4gLod and {
     pio34 = pins.setup(34, nil, pio.PULLDOWN),
     pio35 = pins.setup(35, nil, pio.PULLDOWN),
     pio36 = pins.setup(36, nil, pio.PULLDOWN),
-    -- pio53 = pins.setup(53, nil, pio.PULLDOWN),
-    -- pio54 = pins.setup(54, nil, pio.PULLDOWN),
     pio55 = pins.setup(55, nil, pio.PULLDOWN),
     pio56 = pins.setup(56, nil, pio.PULLDOWN),
     pio59 = pins.setup(59, 0, pio.PULLUP), -- 默认UART2的485方向控制脚
@@ -136,7 +170,7 @@ pios = is4gLod and {
     pio63 = pins.setup(63, nil, pio.PULLDOWN),
     pio64 = pins.setup(64, nil, pio.PULLDOWN), -- NETLED
     pio65 = pins.setup(65, nil, pio.PULLDOWN), -- NETREADY
-    pio67 = pins.setup(67, nil, pio.PULLDOWN), -- NETLED
+    pio67 = pins.setup(67, nil, pio.PULLDOWN),
     pio68 = pins.setup(68, nil, pio.PULLDOWN), -- RSTCNF
     pio69 = pins.setup(69, nil, pio.PULLDOWN),
     pio70 = pins.setup(70, nil, pio.PULLDOWN),
@@ -171,7 +205,7 @@ pios = is4gLod and {
     pio29 = pins.setup(pio.P0_29, nil, pio.PULLDOWN), -- 默认恢复默认值
     pio33 = pins.setup(pio.P1_1, nil, pio.PULLDOWN), -- 默认800 NETLED
     pio34 = pins.setup(pio.P1_2, nil, pio.PULLDOWN),
-}
+})
 
 -- 网络READY信号
 if not dtu.pins or not dtu.pins[2] or not pios[dtu.pins[2]] then -- 这么定义是为了和之前的代码兼容
@@ -183,15 +217,23 @@ end
 
 -- 重置DTU
 if not dtu.pins or not dtu.pins[3] or not pios[dtu.pins[3]] then -- 这么定义是为了和之前的代码兼容
-    pins.setup(is4gLod and 68 or 29, function(msg)
+    pins.setup((is1802S and 17) or (is4gLod and 68) or 29, function(msg)
         if msg ~= cpu.INT_GPIO_POSEDGE then
-            sys.restart("软件恢复出厂默认值:" .. (os.remove(CONFIG) and "OK" or "ERROR!"))
+            if io.exists(CONFIG) then os.remove(CONFIG) end
+            if io.exists("/alikey.cnf") then os.remove("/alikey.cnf") end
+            if io.exists("/qqiot.dat") then os.remove("/qqiot.dat") end
+            if io.exists("/bdiot.dat") then os.remove("/bdiot.dat") end
+            sys.restart("软件恢复出厂默认值: OK")
         end
     end, pio.PULLUP)
 else
     pins.setup(tonumber(dtu.pins[3]:sub(4, -1)), function(msg)
         if msg ~= cpu.INT_GPIO_POSEDGE then
-            sys.restart("软件恢复出厂默认值:" .. (os.remove(CONFIG) and "OK" or "ERROR!"))
+            if io.exists(CONFIG) then os.remove(CONFIG) end
+            if io.exists("/alikey.cnf") then os.remove("/alikey.cnf") end
+            if io.exists("/qqiot.dat") then os.remove("/qqiot.dat") end
+            if io.exists("/bdiot.dat") then os.remove("/bdiot.dat") end
+            sys.restart("软件恢复出厂默认值: OK")
         end
     end, pio.PULLUP)
     pios[dtu.pins[3]] = nil
@@ -420,10 +462,23 @@ local function read(uid)
     end
     -- 执行单次HTTP指令
     if s:sub(1, 5) == "http," then
-        local t = s:match("(.+)\r\n") and s:match("(.+)\r\n"):split(',') or s:split(',')
+        local str = ""
+        local idx1, idx2, jsonstr = s:find(",[\'\"](.+)[\'\"],")
+        if jsonstr then
+            str = s:sub(1, idx1) .. s:sub(idx2, -1)
+        else
+            -- 判是不是json，如果不是json，则是普通的字符串
+            idx1, idx2, jsonstr = s:find(",([%[{].+[%]}]),")
+            if jsonstr then
+                str = s:sub(1, idx1) .. s:sub(idx2, -1)
+            else
+                str = s
+            end
+        end
+        local t = str:match("(.+)\r\n") and str:match("(.+)\r\n"):split(',') or str:split(',')
         if not socket.isReady() then write(uid, "NET_NORDY\r\n") return end
         sys.taskInit(function(t, uid)
-            local code, head, body = httpv2.request(t[2]:upper(), t[3], (t[4] or 10) * 1000, nil, t[5], tonumber(t[6]) or 1, t[7], t[8])
+            local code, head, body = httpv2.request(t[2]:upper(), t[3], (t[4] or 10) * 1000, nil, jsonstr or t[5], tonumber(t[6]) or 1, t[7], t[8])
             log.info("uart http response:", body)
             write(uid, body)
         end, t, uid)
@@ -431,7 +486,8 @@ local function read(uid)
     end
     -- 执行单次SOCKET透传指令
     if s:sub(1, 4):upper() == "TCP," or s:sub(1, 4):upper() == "UDP," then
-        local t = s:match("(.+)\r\n") and s:match("(.+)\r\n"):split(',') or s:split(',')
+        -- local t = s:match("(.+)\r\n") and s:match("(.+)\r\n"):split(',') or s:split(',')
+        s = s:match("(.+)\r\n") or s
         if not socket.isReady() then
             write(uid, "NET_NORDY\r\n")
             return
@@ -447,7 +503,7 @@ local function read(uid)
                 write(uid, "SEND_ERR\r\n")
             end
             c:close()
-        end, uid, unpack(t))
+        end, uid, s:match("(.-),(.-),(.-),(.-),(.-),(.+)"))
         return
     end
     -- 添加设备识别码
@@ -509,7 +565,7 @@ function uart_INIT(i, uconf)
     end)
     -- 485方向控制
     if not dtu.uconf[i][6] or dtu.uconf[i][6] == "" then -- 这么定义是为了和之前的代码兼容
-        default["dir" .. i] = i == 1 and (is4gLod and 23 or 2) or (is4gLod and 59 or 6)
+        default["dir" .. i] = i == 1 and (is1802S and 61 or (is4gLod and 23 or 2)) or (is1802S and 32 or (is4gLod and 59 or 6))
     else
         if pios[dtu.uconf[i][6]] then
             default["dir" .. i] = tonumber(dtu.uconf[i][6]:sub(4, -1))
@@ -530,7 +586,7 @@ sys.taskInit(function()
     local rst, code, head, body, url = false
     while true do
         rst = false
-        if not socket.isReady() and not sys.waitUntil("IP_READY_IND", 300000) then sys.restart("Network initialization failed!") end
+        if not socket.isReady() and not sys.waitUntil("IP_READY_IND", 600000) then sys.restart("Network initialization failed!") end
         if dtu.host and dtu.host ~= "" then
             local param = {product_name = _G.PROJECT, param_ver = dtu.param_ver, imei = misc.getImei()}
             code, head, body = httpv2.request("GET", dtu.host, 30000, param, nil, 1)
@@ -707,6 +763,8 @@ sys.taskInit(create.connect, pios, dtu.conf, dtu.reg, tonumber(dtu.convert) or 0
 ---------------------------------------------------------- 用户自定义任务初始化 ---------------------------------------------------------
 if dtu.task and #dtu.task ~= 0 then
     for i = 1, #dtu.task do
-        if dtu.task[i] and dtu.task[i]:match("function(.+)end") then sys.taskInit(loadstring(dtu.task[i]:match("function(.+)end"))) end
+        if dtu.task[i] and dtu.task[i]:match("function(.+)end") then
+            sys.taskInit(loadstring(dtu.task[i]:match("function(.+)end")))
+        end
     end
 end
